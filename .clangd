@@ -1,0 +1,11 @@
+CompileFlags:
+  CompilationDatabase: build
+  Add:
+    - -I/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Metal.framework/Headers/
+    - -I/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Foundation.framework/Headers/
+    - -I/Users/dna/learn/metal_cpp/story/include
+    - -I/Users/dna/learn/metal_cpp/story/third_party/metal-cpp
+  Remove:
+    - -stdlib=libc++
+
+CompleteMacros: true
