@@ -1,11 +1,10 @@
-#include "Foundation/NSError.hpp"
-#include "Foundation/NSSharedPtr.hpp"
-#include "Foundation/NSString.hpp"
 #include "story/metal.hh"
 #include "story/ops.hh"
+#include "story/runtime.hh"
 #include "story/tensor.hh"
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <iostream>
 #include <random>
@@ -26,41 +25,13 @@ int main(int argc, char **argv) {
   }
   auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 
-  // todo
-  auto device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
-  require(device.get(), "Metal device not found");
-
-  // Create a command queue
-  auto queue = NS::TransferPtr(device->newCommandQueue());
-  require(queue.get(), "Cannot create command queue\n");
-
-  // create an error so if the lib load fails it point sothe err
-  NS::Error *error = nullptr;
-
-  const char *path = argv[1];
-  auto lib = NS::TransferPtr(device->newLibrary(
-      NS::String::string(path, NS::UTF8StringEncoding), &error
-
-      ));
-  require(lib.get(), error ? error->localizedDescription()->utf8String()
-                           : "Cannot load lib");
+  Runtime runtime("build/kernels/tensor.metallib");
 
   const char *ker_name = argc > 2 ? argv[2] : "add_parallel";
 
-  auto func = NS::TransferPtr(
-      lib->newFunction(NS::String::string(ker_name, NS::UTF8StringEncoding)));
-  require(func.get(), "Cannot create function");
+  printf("Using device: %s\n", runtime.device->name()->utf8String());
 
-  auto pipeline =
-      NS::TransferPtr(device->newComputePipelineState(func.get(), &error));
-  require(pipeline.get(), "cannot create pipeline");
-
-  if (!device.get())
-    throw std::runtime_error("No Metal device");
-
-  printf("Using device: %s\n", device->name()->utf8String());
-
-  uint32_t n = 8293376;
+  uint32_t n = 4096 * 2048;
   if (n % 1024 != 0) {
     throw std::runtime_error("n must be a multiple of 1024");
   };
@@ -68,59 +39,71 @@ int main(int argc, char **argv) {
   std::vector<uint32_t> shape = {n / 1024, 1024};
   printf("\nTensors have shape %d,%d\n\n", shape[0], shape[1]);
 
-  Tensor x(device.get(), shape), y(device.get(), shape);
-
-  // Create a random number generator
-  std::mt19937 rng(1234);
-  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
-  // Fill x and y with random values
-  for (int i = 0; i < x.numel(); i++) {
-    x[i] = dist(rng);
-    y[i] = dist(rng);
-  }
-
-  float *p = x.data();
-  p[2] = 9;
-  std::cout << x.at(9, 835) << '\n';
+  Tensor x(runtime, shape), y(runtime, shape);
 
   auto t0 = std::chrono::high_resolution_clock::now();
-  Tensor output = add_cpu(device.get(), x, y);
+  Tensor output = add_cpu(runtime, x, y);
   auto t1 = std::chrono::high_resolution_clock::now();
   auto cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
   std::cout << "CPU add: " << cpu_ms << " ms\n";
 
   // GPU serial
-  auto *command = queue->commandBuffer();
-  auto *encoder = command->computeCommandEncoder();
+  //
+  Tensor output_gpu(runtime, x.shape());
 
-  Tensor output_gpu(device.get(), x.numel());
+  printf("Before transpose x[2,3] = %.3f\n", x.at({2, 3}));
+  auto transposed = x.transpose(0, 1);
 
-  encoder->setComputePipelineState(pipeline.get());
-  encoder->setBuffer(x.buffer(), 0, 0);
-  encoder->setBuffer(y.buffer(), 0, 1);
-  encoder->setBuffer(output_gpu.buffer(), 0, 2);
-  encoder->setBytes(&n, sizeof(n), 3);
+  printf("After transpose x[2,3] = %.3f\n", transposed.at({2, 3}));
 
-  const auto threads = std::string_view(ker_name) == "add_parallel"
-                           ? pipeline->threadExecutionWidth()
-                           : 1;
+  Tensor zeros = Tensor::zeroes(runtime, shape);
+  Tensor one = Tensor::ones(runtime, shape);
+  printf("zeros[2,3] = %.3f\n", zeros.at({2, 3}));
+  printf("ones[2,3] = %.3f\n", one.at({2, 3}));
 
-  const auto groups = std::string_view(ker_name) == "add_parallel"
-                          ? (n + threads - 1) / threads
-                          : 1;
+  struct AddParams {
+    uint32_t n;
+  };
+  AddParams a = {n};
+  LaunchConfig cfg = launch_1d(n);
 
-  encoder->dispatchThreadgroups(MTL::Size(groups, 1, 1),
-                                MTL::Size(threads, 1, 1));
-  encoder->endEncoding();
+  auto time =
+      runtime.run("add_parallel", {x.buffer(), y.buffer(), output_gpu.buffer()},
+                  &a, sizeof(a), 3, cfg.threadgroups, cfg.threadspergroup);
 
-  t0 = std::chrono::high_resolution_clock::now();
-  command->commit();
-  command->waitUntilCompleted();
-  t1 = std::chrono::high_resolution_clock::now();
+  printf("GPU add took %.3fms\n", time);
+  printf("Given x = %.3f and y = %.3f: GPU add: %.3f\n", x.at({2, 3}),
+         y.at({2, 3}), output_gpu.at({2, 3}));
 
-  auto serial_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-  std::cout << "GPU add : " << serial_ms << " ms\n";
-  require(command->status() != MTL::CommandBufferStatusError,
-          "command buffer failed");
+  printf("TEST WITH + \n");
+
+  Tensor ouput_gpu2 = x + y;
+
+  printf("Given x = %.3f and y = %.3f: GPU add: %.3f\n", x.at({2, 3}),
+         y.at({2, 3}), ouput_gpu2.at({2, 3}));
+
+  printf("testing with needed broad casting\n");
+  Tensor x2(runtime, {1, 2048, 512}), y2(runtime, {57, 2048, 1});
+  Tensor output_gpu3 = x2 + y2;
+  printf("Given x= %.3f and y = %.3f: GPU add: %.3f\n", x2.at({0, 3, 0}),
+
+         y2.at({0, 3, 0}), output_gpu3.at({0, 3, 0}));
+
+  printf("testing relu add\n");
+
+  Tensor output_gpu4 = add(runtime, x, y, true);
+  printf("Given x= %.3f and y = %.3f: GPU add: %.3f\n", x.at({2, 3}),
+         y.at({2, 3}), output_gpu4.at({2, 3}));
+
+  printf("testing relu add scalar \n");
+  Tensor output_gpu5 = add(runtime, x, 0.5, true);
+  printf("Given x= %.3f and y = %f : GPU add: %.3f\n", x.at({2, 3}), 0.5,
+         output_gpu5.at({2, 3}));
+
+  printf("testing relu mul scalar \n");
+  Tensor output_gpu6 = multiply(runtime, x, 0.5, true);
+  printf("Given x= %.3f and y = %f : GPU add: %.3f\n", x.at({2, 3}), 0.5,
+         output_gpu6.at({2, 3}));
+
+  return 0;
 }
